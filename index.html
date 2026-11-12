@@ -204,7 +204,8 @@ body::before{content:"";position:fixed;inset:0 0 auto;height:env(safe-area-inset
 .empty{background:var(--surface);border:1px dashed var(--line);border-radius:var(--r);padding:22px 18px;text-align:center;display:grid;gap:10px;justify-items:center}
 .empty h3{margin:0;font:700 22px/1.1 var(--f-display);text-transform:uppercase}
 .empty p{margin:0;color:var(--muted);max-width:42ch}
-.btn{height:42px;padding:0 18px;border-radius:12px;background:var(--accent);color:var(--accent-ink);font-weight:700;display:inline-flex;align-items:center;gap:8px}
+.btn{white-space:nowrap;flex:none;height:42px;padding:0 18px;border-radius:12px;background:var(--accent);color:var(--accent-ink);font-weight:700;display:inline-flex;align-items:center;gap:8px}
+.btn svg{width:18px;height:18px;flex:none}
 .btn.ghost{background:var(--surface);color:var(--ink);border:1px solid var(--line)}
 .btn.sm{height:34px;padding:0 12px;font-size:13px;border-radius:10px}
 .sk{background:linear-gradient(90deg,var(--surface-2),var(--surface),var(--surface-2));background-size:200% 100%;animation:sh 1.2s infinite;border-radius:var(--r)}
@@ -412,13 +413,40 @@ async function api(lg, path, params={}, ttl=60e3){
 function boardParams(lg, day){ const q={...(LG[lg].q||{})}; const today=ymd(new Date()); if(LG[lg].t || day!==today) q.dates=day; return q; }
 const loadBoard = (lg, day) => api(lg,'scoreboard',boardParams(lg,day),30e3);
 
+/* Team list: tries several ESPN sources and pulls every team object it finds */
+function collectTeams(obj, out=new Map(), depth=0){
+  if(!obj || typeof obj!=='object' || depth>12) return out;
+  if(Array.isArray(obj)){ for(const x of obj) collectTeams(x,out,depth+1); return out; }
+  const t=obj.team;
+  if(t && typeof t==='object' && t.id && (t.displayName||t.name||t.location) && !out.has(String(t.id))) out.set(String(t.id), t);
+  for(const k in obj){ const v=obj[k]; if(v && typeof v==='object' && k!=='team') collectTeams(v,out,depth+1); }
+  return out;
+}
+async function getJSON(url, ttl=864e5){
+  const hit=mem.get(url); if(hit?.d && Date.now()-hit.t<ttl) return hit.d;
+  const r=await fetch(url); if(!r.ok) throw new Error('HTTP '+r.status);
+  const d=await r.json(); mem.set(url,{t:Date.now(),d}); return d;
+}
 async function teamsList(lg){
   const ck='sl.teams.'+lg, c=lsGet(ck,null);
-  if(c && Date.now()-c.t < 864e5) return c.v;
-  const d=await api(lg,'teams',{limit:1000},864e5);
-  const v=(d.sports?.[0]?.leagues?.[0]?.teams||[]).map(x=>x.team).map(t=>({id:t.id, name:t.displayName, short:t.shortDisplayName||t.location||t.displayName, abbr:t.abbreviation, logo:logoOf(t), color:t.color}))
-    .sort((a,b)=>a.name.localeCompare(b.name));
-  lsSet(ck,{t:Date.now(),v}); return v;
+  if(c && c.v?.length && Date.now()-c.t < 864e5) return c.v;
+  const L=LG[lg], found=new Map(), errs=[];
+  const sources=[
+    ()=>api(lg,'teams',{limit:1000},864e5),
+    ()=>api(lg,'teams',{},864e5),
+    ()=>getJSON('https://site.api.espn.com/apis/v2/sports/'+L.p+'/standings'),
+    ()=>api(lg,'scoreboard',L.q||{},10*60e3),
+    ()=>L.rk?api(lg,'rankings',{},10*60e3):null,
+  ];
+  for(const src of sources){
+    try{ const d=await src(); if(d) collectTeams(d,found); }catch(e){ errs.push(e.message); }
+    if(found.size>=(L.col?100:10)) break;
+  }
+  if(!found.size) throw new Error(errs[0]||'No teams found');
+  const v=[...found.values()].map(t=>({id:String(t.id), name:t.displayName||[t.location,t.name].filter(Boolean).join(' ')||t.name, short:t.shortDisplayName||t.location||t.displayName||t.name, abbr:t.abbreviation||'', logo:logoOf(t), color:t.color}))
+    .filter(t=>t.name).sort((a,b)=>String(a.name).localeCompare(String(b.name)));
+  if(v.length>=(L.col?100:10)) lsSet(ck,{t:Date.now(),v});
+  return v;
 }
 
 /* Normalize a scoreboard event into competitions we can draw */
@@ -858,7 +886,7 @@ async function openPicker(){
 let pickerTeams=[];
 async function drawPicker(){
   const lg=PK.lg, box=$('#pkList'); if(!box) return;
-  try{ pickerTeams=await teamsList(lg); }catch(e){ box.innerHTML='<div class="err">Couldn’t load teams. Check your connection.</div>'; return; }
+  try{ pickerTeams=await teamsList(lg); }catch(e){ console.warn(e); box.innerHTML=`<div class="err">Couldn’t load teams (${esc(e.message)}). Try another league, then come back to this one.</div>`; return; }
   if(PK.lg!==lg) return;
   const q=PK.q.trim().toLowerCase();
   const list=pickerTeams.filter(t=>!q||t.name.toLowerCase().includes(q)||(t.abbr||'').toLowerCase()===q);
